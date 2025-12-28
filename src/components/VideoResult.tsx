@@ -37,91 +37,112 @@ const VideoResult = ({ video, originalUrl }: VideoResultProps) => {
     }
   };
 
-  const videoDownloadUrl = `$1&type=video&stream=1&filename=${encodeURIComponent(video.title)}`;
-  const audioDownloadUrl = `$1&type=audio&stream=1&filename=${encodeURIComponent(video.title)}`;
+  const baseProxy = `/api/proxy?url=${encodeURIComponent(originalUrl)}&stream=1&filename=${encodeURIComponent(
+    video.title
+  )}`;
+
+  const videoDownloadUrl = `${baseProxy}&type=video`;
+  const audioDownloadUrl = `${baseProxy}&type=audio`;
 
   return (
-    <div className="glass-card-premium p-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
-      <div className="flex flex-col lg:flex-row gap-8">
-        {/* Thumbnail */}
-        <div className="relative flex-shrink-0 w-full lg:w-96 aspect-video rounded-2xl overflow-hidden group">
-          <img
-            src={video.thumbnail}
-            alt={video.title}
-            className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-110"
-          />
-          <div className="absolute inset-0 bg-gradient-to-t from-background via-background/20 to-transparent" />
-          
-          {/* Platform & Duration badges */}
-          <div className="absolute bottom-4 left-4 right-4 flex items-center justify-between">
-            <span className="platform-badge">{video.platform}</span>
-            {video.duration && (
-              <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-background/70 text-sm backdrop-blur-md font-medium">
-                <Clock className="w-3.5 h-3.5" />
-                {video.duration}
-              </span>
-            )}
-          </div>
-          
-          {/* Play overlay */}
-          <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-            <div className="w-16 h-16 rounded-full bg-primary/90 flex items-center justify-center backdrop-blur-sm">
-              <div className="w-0 h-0 border-l-[20px] border-l-background border-y-[12px] border-y-transparent ml-1" />
+    <div className="w-full max-w-4xl mx-auto mt-8">
+      <div className="relative overflow-hidden rounded-3xl bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl">
+        <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-accent/10" />
+
+        <div className="relative p-6 md:p-8">
+          <div className="flex flex-col md:flex-row gap-6 md:gap-8">
+            {/* Thumbnail */}
+            <div className="relative flex-shrink-0">
+              <div className="w-full md:w-64 aspect-video rounded-2xl overflow-hidden bg-black/20 shadow-lg">
+                {video.thumbnail ? (
+                  <img
+                    src={video.thumbnail}
+                    alt={video.title}
+                    className="w-full h-full object-cover"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                    <Video className="w-12 h-12" />
+                  </div>
+                )}
+              </div>
+
+              <div className="absolute top-3 left-3 px-3 py-1 rounded-full bg-black/60 backdrop-blur-sm text-white text-sm font-medium">
+                {video.platform}
+              </div>
             </div>
-          </div>
-        </div>
 
-        {/* Info & Downloads */}
-        <div className="flex-1 flex flex-col gap-6">
-          <div>
-            <h3 className="text-2xl font-bold text-foreground line-clamp-2 mb-3">
-              {video.title}
-            </h3>
-            {video.views && (
-              <p className="flex items-center gap-2 text-muted-foreground">
-                <Eye className="w-4 h-4" />
-                <span>{video.views} {t('video.views')}</span>
-              </p>
-            )}
-          </div>
+            {/* Content */}
+            <div className="flex-1 space-y-4">
+              <h3 className="text-xl md:text-2xl font-bold text-foreground leading-tight">
+                {video.title}
+              </h3>
 
-          {/* Download Buttons */}
-          <div className="flex flex-col gap-4">
-            <p className="text-sm text-muted-foreground font-medium uppercase tracking-wider">
-              {t('video.downloadOptions')}
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {/* Video Download */}
-              <a
-                href={videoDownloadUrl}
-                target="_self"
-                onClick={(e) => { e.preventDefault(); downloadViaFetch(videoDownloadUrl, `${video.title}.mp4`); }}
-                className="download-option-btn group flex items-center justify-between"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-primary text-background">
-                    <Video className="w-5 h-5" />
+              <div className="flex flex-wrap gap-4 text-sm text-muted-foreground">
+                {video.duration && (
+                  <div className="flex items-center gap-2">
+                    <Clock className="w-4 h-4" />
+                    <span>{video.duration}</span>
                   </div>
-                  <span className="font-semibold">{t('video.downloadVideo')}</span>
-                </div>
-                <Download className="w-5 h-5" />
-              </a>
-
-              {/* Audio Download */}
-              <a
-                href={audioDownloadUrl}
-                target="_self"
-                onClick={(e) => { e.preventDefault(); downloadViaFetch(audioDownloadUrl, `${video.title}.mp3`); }}
-                className="download-option-btn group flex items-center justify-between"
-              >
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-primary text-background">
-                    <Music className="w-5 h-5" />
+                )}
+                {video.views && (
+                  <div className="flex items-center gap-2">
+                    <Eye className="w-4 h-4" />
+                    <span>{video.views}</span>
                   </div>
-                  <span className="font-semibold">{t('video.downloadAudio')}</span>
+                )}
+              </div>
+
+              {/* Download Buttons */}
+              <div className="flex flex-col gap-4">
+                <p className="text-sm text-muted-foreground font-medium uppercase tracking-wider">
+                  {t('video.downloadOptions')}
+                </p>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {/* Video Download */}
+                  <a
+                    href={videoDownloadUrl}
+                    target="_self"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      downloadViaFetch(videoDownloadUrl, `${video.title}.mp4`);
+                    }}
+                    className="download-option-btn group flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-primary text-background">
+                        <Video className="w-5 h-5" />
+                      </div>
+                      <span className="font-semibold">{t('video.downloadVideo')}</span>
+                    </div>
+                    <Download className="w-5 h-5" />
+                  </a>
+
+                  {/* Audio Download */}
+                  <a
+                    href={audioDownloadUrl}
+                    target="_self"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      downloadViaFetch(audioDownloadUrl, `${video.title}.mp3`);
+                    }}
+                    className="download-option-btn group flex items-center justify-between"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl flex items-center justify-center bg-accent text-background">
+                        <Music className="w-5 h-5" />
+                      </div>
+                      <span className="font-semibold">{t('video.downloadAudio')}</span>
+                    </div>
+                    <Download className="w-5 h-5" />
+                  </a>
                 </div>
-                <Download className="w-5 h-5" />
-              </a>
+
+                <p className="text-xs text-muted-foreground/80">
+                  ملاحظة: بعض المنصات قد تعطي الصوت بصيغة m4a لكن سيتم تنزيله مباشرة.
+                </p>
+              </div>
             </div>
           </div>
         </div>
