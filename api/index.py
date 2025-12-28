@@ -14,199 +14,291 @@ app = FastAPI()
 # -----------------------------
 # Helpers
 # -----------------------------
-MEDIA_TYPE = Literal["video", "audio"]
 
-DEFAULT_HEADERS = {
-    # A fairly common desktop UA helps with some extractors
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-}
 
-def _safe_filename(name: str, ext: str) -> str:
+def _is_tiktok(url: str) -> bool:
+    u = url.lower()
+    return ("tiktok.com" in u) or ("vt.tiktok.com" in u) or ("vm.tiktok.com" in u)
+
+
+def _sanitize_filename(name: str) -> str:
     name = (name or "download").strip()
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = re.sub(r'[\\/*?:"<>|]+', "", name)
     name = re.sub(r"\s+", " ", name).strip()
     if not name:
         name = "download"
-    if ext and not ext.startswith("."):
-        ext = "." + ext
-    return f"{name}{ext}"
+    return name[:120]
 
-def _ydl_opts() -> dict:
-    # NOTE: We do NOT write to disk. We only extract direct CDN URLs.
-    # We also avoid formats that require server-side merging (ffmpeg not available on Vercel).
-    return {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "nocheckcertificate": True,
-        "geo_bypass": True,
-        "socket_timeout": 15,
-        "http_headers": DEFAULT_HEADERS,
-        # Some sites need this to avoid slow checks
-        "consoletitle": False,
-    }
 
-def _is_youtube(url: str) -> bool:
-    u = url.lower()
-    return "youtube.com" in u or "youtu.be" in u
-
-def _pick_direct_urls(info: dict) -> tuple[Optional[dict], Optional[dict]]:
+def _pick_best_youtube_with_audio(info: dict) -> Optional[str]:
     """
-    Returns (best_video_with_audio, best_audio_only) format dicts.
-    For YouTube we prefer *progressive* formats that already include audio (acodec != none).
+    YouTube: Prefer a progressive MP4 (video+audio) when possible.
+    If none exists, return None and let /proxy pick a merged format fallback strategy.
     """
     formats = info.get("formats") or []
-    if not formats:
-        # some extractors provide a single direct url
-        u = info.get("url")
-        if u:
-            return ({"url": u, "ext": info.get("ext") or "mp4"}, None)
-        return (None, None)
+    progressive = []
+    for f in formats:
+        # progressive usually has both acodec and vcodec not "none"
+        v = f.get("vcodec")
+        a = f.get("acodec")
+        url = f.get("url")
+        ext = f.get("ext")
+        if not url:
+            continue
+        if v and v != "none" and a and a != "none":
+            progressive.append(f)
 
-    # audio-only candidates
-    audio_candidates = [
-        f for f in formats
-        if f.get("url") and f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
-    ]
-    best_audio = None
-    if audio_candidates:
-        best_audio = max(
-            audio_candidates,
-            key=lambda f: (
-                f.get("abr") or 0,
-                f.get("tbr") or 0,
-                f.get("filesize") or 0,
-            ),
-        )
+    # Prefer mp4 progressive with highest resolution/bitrate
+    mp4_prog = [f for f in progressive if (f.get("ext") == "mp4")]
+    pool = mp4_prog or progressive
+    if not pool:
+        return None
 
-    # video candidates
-    if _is_youtube(info.get("webpage_url") or info.get("original_url") or ""):
-        # YouTube: choose progressive formats with audio included
-        video_candidates = [
-            f for f in formats
-            if f.get("url")
-            and f.get("vcodec") not in (None, "none")
-            and f.get("acodec") not in (None, "none")
-        ]
-    else:
-        # Other sites: often already muxed; prefer those with audio, fallback to best video
-        video_candidates = [
-            f for f in formats
-            if f.get("url") and f.get("vcodec") not in (None, "none")
-        ]
-        muxed = [f for f in video_candidates if f.get("acodec") not in (None, "none")]
-        if muxed:
-            video_candidates = muxed
+    def score(f):
+        h = f.get("height") or 0
+        tbr = f.get("tbr") or 0
+        return (h, tbr)
 
-    best_video = None
-    if video_candidates:
-        best_video = max(
-            video_candidates,
-            key=lambda f: (
-                f.get("height") or 0,
-                f.get("tbr") or 0,
-                f.get("fps") or 0,
-                f.get("filesize") or 0,
-            ),
-        )
+    pool.sort(key=score, reverse=True)
+    return pool[0].get("url")
 
-    return (best_video, best_audio)
 
-def _extract_info(url: str) -> dict:
-    # TikTok fallback: TikWM API (often more reliable on serverless IPs)
-    if "tiktok.com" in url.lower():
-        try:
-            r = requests.post("https://www.tikwm.com/api/", data={"url": url}, timeout=10)
-            data = r.json().get("data") or {}
-            # Normalize TikWM into an info-like structure
-            return {
-                "title": data.get("title") or "TikTok",
-                "thumbnail": data.get("cover") or data.get("origin_cover") or "",
-                "duration": "",
-                "webpage_url": url,
-                "formats": [
-                    {"url": data.get("play"), "ext": "mp4", "vcodec": "h264", "acodec": "aac", "height": 720, "tbr": 0},
-                    {"url": data.get("music"), "ext": "mp3", "vcodec": "none", "acodec": "mp3", "abr": 128, "tbr": 0},
-                ],
-            }
-        except Exception:
-            # Fall back to yt-dlp below
-            pass
+def _pick_best_audio(info: dict) -> Optional[str]:
+    formats = info.get("formats") or []
+    audios = []
+    for f in formats:
+        url = f.get("url")
+        if not url:
+            continue
+        if f.get("vcodec") == "none":
+            audios.append(f)
 
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+    if not audios:
+        return None
+
+    def score(f):
+        abr = f.get("abr") or 0
+        asr = f.get("asr") or 0
+        return (abr, asr)
+
+    audios.sort(key=score, reverse=True)
+    return audios[0].get("url")
+
 
 async def _stream_remote(url: str):
-    async with httpx.AsyncClient(headers=DEFAULT_HEADERS, follow_redirects=True, timeout=30) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
-                if chunk:
-                    yield chunk
-
-# -----------------------------
-# API
-# -----------------------------
-
-@app.get("/api/download")
-def get_video_info(url: str = Query(..., description="Video URL")):
     """
-    Returns metadata (title/thumbnail/duration) used by the frontend UI.
+    Stream bytes from remote URL without saving to disk.
+    """
+    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            async for chunk in r.aiter_bytes(chunk_size=1024 * 256):
+                yield chunk
+
+
+def _yt_dlp_extract(url: str) -> dict:
+    """
+    Extract metadata without downloading.
+    """
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        # Reduce bans: set a common UA + headers
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def _normalize_info(info: dict) -> dict:
+    """
+    Return only what frontend needs.
+    """
+    title = info.get("title") or "download"
+    thumb = info.get("thumbnail")
+    extractor = info.get("extractor_key") or info.get("extractor") or ""
+    webpage_url = info.get("webpage_url") or info.get("original_url") or info.get("url")
+
+    return {
+        "title": title,
+        "thumbnail": thumb,
+        "extractor": extractor,
+        "webpage_url": webpage_url,
+        "formats_count": len(info.get("formats") or []),
+    }
+
+
+# -----------------------------
+# TikTok via TikWM
+# -----------------------------
+
+
+def _tikwm_info(url: str) -> dict:
+    """
+    TikTok: Use TikWM API to avoid bans / rate limits.
+    """
+    api = "https://www.tikwm.com/api/"
+    try:
+        r = requests.post(api, data={"url": url}, timeout=20)
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TikTok API error: {e}")
+
+    data = payload.get("data") or {}
+    if not data:
+        raise HTTPException(status_code=400, detail="TikTok API returned no data")
+
+    # direct links
+    video_no_watermark = data.get("play")  # usually no watermark
+    video_watermark = data.get("wmplay")
+    music = data.get("music")
+
+    title = data.get("title") or "tiktok"
+    cover = data.get("cover") or data.get("origin_cover") or data.get("ai_dynamic_cover")
+
+    return {
+        "title": title,
+        "thumbnail": cover,
+        "video": video_no_watermark or video_watermark,
+        "audio": music,
+        "extractor": "TikTok",
+        "webpage_url": url,
+    }
+
+
+# -----------------------------
+# Endpoints
+# -----------------------------
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/info")
+def info(url: str = Query(..., min_length=4)):
+    """
+    Get metadata for UI: title, thumbnail.
+    For TikTok, use TikWM, else yt-dlp.
     """
     try:
-        info = _extract_info(url)
-        title = info.get("title") or "Video"
-        thumbnail = info.get("thumbnail") or ""
-        duration = info.get("duration") or ""
+        if _is_tiktok(url):
+            t = _tikwm_info(url)
+            return JSONResponse(
+                {
+                    "title": t["title"],
+                    "thumbnail": t["thumbnail"],
+                    "extractor": t["extractor"],
+                    "webpage_url": t["webpage_url"],
+                    "tiktok": True,
+                }
+            )
 
-        # keep compatibility with current frontend
-        return JSONResponse(
-            {
-                "success": True,
-                "video_info": {
-                    "title": title,
-                    "thumbnail": thumbnail,
-                    "duration": str(duration) if duration else "",
-                    "download_url": url,
-                },
-            }
-        )
+        info_dict = _yt_dlp_extract(url)
+        return JSONResponse({**_normalize_info(info_dict), "tiktok": False})
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse(
-            {"success": False, "error": "FAILED_TO_FETCH", "details": str(e)},
-            status_code=400,
-        )
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.get("/api/proxy")
-async def proxy_download(
-    url: str = Query(..., description="Original video URL"),
-    type: MEDIA_TYPE = Query("video", description="video|audio"),
-    stream: int = Query(1, description="1 = stream through server (recommended for mobile); 0 = redirect"),
-    filename: Optional[str] = Query(None, description="Preferred filename without extension"),
+async def proxy(
+    url: str = Query(..., min_length=4),
+    kind: Literal["video", "audio"] = Query("video"),
+    stream: int = Query(
+        1,
+        description="1=stream as attachment (download instantly), 0=redirect to direct CDN link",
+    ),
 ):
     """
-    Provides a downloadable response without storing on disk.
-    - stream=1: streams the remote file via Vercel function and sets Content-Disposition.
-    - stream=0: redirects to the direct CDN link (fastest, but may navigate).
+    Generate a direct download behavior without writing files to disk.
+
+    - For TikTok: via TikWM (video/audio direct).
+    - For YouTube:
+        - video: prefer progressive mp4 with audio, otherwise let yt-dlp provide best merged target URL if available
+        - audio: pick best audio-only
+    - For others (IG/FB/Twitter/etc): use yt-dlp extracted direct URL for best match.
     """
     try:
-        info = _extract_info(url)
-        best_video, best_audio = _pick_direct_urls(info)
+        final_name = "download.bin"
+        direct = None
 
-        chosen = best_video if type == "video" else best_audio
-        if not chosen or not chosen.get("url"):
-            raise HTTPException(status_code=404, detail="NO_DIRECT_URL")
+        if _is_tiktok(url):
+            t = _tikwm_info(url)
+            title = _sanitize_filename(t.get("title"))
+            if kind == "audio":
+                direct = t.get("audio")
+                final_name = f"{title}.mp3"
+            else:
+                direct = t.get("video")
+                final_name = f"{title}.mp4"
 
-        direct = chosen["url"]
-        ext = chosen.get("ext") or ("mp3" if type == "audio" else "mp4")
+            if not direct:
+                raise HTTPException(status_code=400, detail="No direct TikTok link found")
 
-        base_title = filename or info.get("title") or "download"
-        final_name = _safe_filename(base_title, ext)
+        else:
+            info_dict = _yt_dlp_extract(url)
+            title = _sanitize_filename(info_dict.get("title") or "download")
 
+            # YouTube special preference
+            is_youtube = (info_dict.get("extractor_key") or "").lower() in ("youtube", "youtube:tab", "youtube:shorts")
+            if is_youtube:
+                if kind == "audio":
+                    direct = _pick_best_audio(info_dict)
+                    final_name = f"{title}.m4a"
+                else:
+                    direct = _pick_best_youtube_with_audio(info_dict)
+                    # If no progressive exists, fall back to the best single url (may be video-only for some cases)
+                    if not direct:
+                        # fallback: best format url from yt-dlp's selected best
+                        direct = info_dict.get("url")
+                    final_name = f"{title}.mp4"
+            else:
+                # Generic: pick best based on kind
+                if kind == "audio":
+                    direct = _pick_best_audio(info_dict) or info_dict.get("url")
+                    final_name = f"{title}.m4a"
+                else:
+                    # Prefer non-audio-only format
+                    formats = info_dict.get("formats") or []
+                    candidates = []
+                    for f in formats:
+                        if not f.get("url"):
+                            continue
+                        if kind == "video" and f.get("vcodec") and f.get("vcodec") != "none":
+                            candidates.append(f)
+
+                    if candidates:
+                        def score(f):
+                            h = f.get("height") or 0
+                            tbr = f.get("tbr") or 0
+                            return (h, tbr)
+
+                        candidates.sort(key=score, reverse=True)
+                        direct = candidates[0].get("url")
+                    else:
+                        direct = info_dict.get("url")
+                    final_name = f"{title}.mp4"
+
+            if not direct:
+                raise HTTPException(status_code=400, detail="No direct link found for this URL")
+
+        # Option 1: Redirect to direct CDN link (some browsers open new tab)
         if stream == 0:
             return RedirectResponse(url=direct)
 
+        # Option 2: Stream as attachment (forces download in same tab typically)
         headers = {
             "Content-Disposition": f'attachment; filename="{final_name}"',
             "Cache-Control": "no-store",
