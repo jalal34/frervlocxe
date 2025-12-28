@@ -1,240 +1,290 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Literal, Tuple, Dict, Any, List
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 import yt_dlp
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+
 
 app = FastAPI()
 
-# =========================
-# Basic settings
-# =========================
+# CORS (لـ /api/info وطلبات الفرونت)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-DEFAULT_HEADERS = {
-    # موبايل UA يساعد أحيانًا
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-    "Connection": "keep-alive",
-}
 
-FILENAME_SAFE_RE = re.compile(r'[^A-Za-z0-9\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF _\-\.\(\)\[\]]+')
+UA = (
+    "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+)
 
-def _safe_filename(name: str, ext: str) -> str:
-    base = (name or "video").strip()
-    base = base[:160]
-    base = FILENAME_SAFE_RE.sub("", base).strip()
-    if not base:
-        base = "video"
-    if not ext:
-        ext = "mp4"
-    ext = ext.lstrip(".")
-    return f"{base}.{ext}"
+# فلترة اسم الملف
+def safe_filename(name: str, default: str = "download") -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[\\/*?:\"<>|]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    if not name:
+        name = default
+    if len(name) > 120:
+        name = name[:120]
+    return name
 
-def _is_youtube(url: str) -> bool:
-    u = (url or "").lower()
-    return "youtube.com" in u or "youtu.be" in u
 
-def _is_m3u8_format(f: Dict[str, Any]) -> bool:
-    # يستبعد HLS
-    proto = (f.get("protocol") or "").lower()
-    ext = (f.get("ext") or "").lower()
-    url = (f.get("url") or "").lower()
-    if ext == "m3u8":
-        return True
-    if "m3u8" in proto:
-        return True
-    if ".m3u8" in url:
-        return True
-    return False
-
-def _ydl_opts() -> Dict[str, Any]:
+def ydl_opts() -> Dict[str, Any]:
+    # ملاحظة: لا تنزيل على القرص (Vercel readonly) — فقط extract_info
     return {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
-        "cachedir": False,
         "nocheckcertificate": True,
-        "http_headers": DEFAULT_HEADERS,
-        # يحسن بعض الحالات
-        "extractor_retries": 2,
-        "retries": 2,
-        "socket_timeout": 15,
+        "noplaylist": True,
+        "user_agent": UA,
+        "http_headers": {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"},
+        # مهم لبعض المنصات
+        "extractor_args": {
+            "youtube": {"skip": ["dash", "hls"]},
+        },
     }
 
-def _extract_info(url: str) -> Dict[str, Any]:
-    with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
 
-def _pick_best_audio(formats: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    audio = [
-        f for f in formats
-        if f.get("url")
-        and f.get("acodec") not in (None, "none")
-        and f.get("vcodec") in (None, "none")
-        and not _is_m3u8_format(f)
-    ]
-    if not audio:
-        # أحياناً الصوت يكون muxed داخل mp4 (بدون audio-only واضح)
-        return None
-    return max(
-        audio,
-        key=lambda f: (
-            f.get("abr") or 0,
-            f.get("tbr") or 0,
-            f.get("filesize") or 0,
-        ),
-    )
+def detect_platform(url: str) -> str:
+    u = url.lower()
+    if "tiktok.com" in u:
+        return "tiktok"
+    if "youtube.com" in u or "youtu.be" in u:
+        return "youtube"
+    if "instagram.com" in u:
+        return "instagram"
+    if "facebook.com" in u or "fb.watch" in u:
+        return "facebook"
+    if "snapchat.com" in u:
+        return "snapchat"
+    if "pinterest." in u:
+        return "pinterest"
+    if "x.com" in u or "twitter.com" in u:
+        return "x/twitter"
+    return "generic"
 
-def _pick_best_video_with_audio(info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    formats = info.get("formats") or []
-    if not formats:
-        u = info.get("url")
-        if u:
-            return {"url": u, "ext": info.get("ext") or "mp4"}
-        return None
 
-    page = info.get("webpage_url") or info.get("original_url") or ""
-    yt = _is_youtube(page)
-
-    # 1) نفضل mp4 + صوت (progressive)
-    progressive = [
-        f for f in formats
-        if f.get("url")
-        and f.get("vcodec") not in (None, "none")
-        and f.get("acodec") not in (None, "none")
-        and not _is_m3u8_format(f)
-        and (not yt or (f.get("ext") or "").lower() in ("mp4", "m4v"))
-    ]
-    if progressive:
-        return max(
-            progressive,
-            key=lambda f: (
-                f.get("height") or 0,
-                f.get("tbr") or 0,
-                f.get("fps") or 0,
-                f.get("filesize") or 0,
-            ),
-        )
-
-    # 2) لو ما في progressive: نختار أفضل فيديو (mp4) حتى لو بدون صوت (قد يفشل لو يحتاج دمج)
-    # لكن نحاول نستبعد m3u8
-    video_only = [
-        f for f in formats
-        if f.get("url")
-        and f.get("vcodec") not in (None, "none")
-        and not _is_m3u8_format(f)
-    ]
-    if video_only:
-        return max(
-            video_only,
-            key=lambda f: (
-                f.get("height") or 0,
-                f.get("tbr") or 0,
-                f.get("fps") or 0,
-                f.get("filesize") or 0,
-            ),
-        )
-
-    return None
-
-async def _stream_remote(url: str):
-    # Streaming مباشر بدون تخزين على disk
-    async with httpx.AsyncClient(headers=DEFAULT_HEADERS, follow_redirects=True, timeout=30) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.aiter_bytes(chunk_size=1024 * 256):
-                if chunk:
-                    yield chunk
-
-# =========================
-# API
-# =========================
-
-@app.get("/api/download")
-def api_download(url: str = Query(..., description="Video URL")):
+async def tiktok_direct(url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
-    Frontend metadata endpoint.
+    محاولة استخراج روابط تيك توك عبر TikWM (أحياناً أنجح من yt-dlp على سيرفرليس).
+    يعيد: (video_url, audio_url, title)
     """
+    api = f"https://www.tikwm.com/api/?url={quote(url)}"
     try:
-        info = _extract_info(url)
+        async with httpx.AsyncClient(timeout=20, headers={"User-Agent": UA}) as client:
+            r = await client.get(api)
+            if r.status_code != 200:
+                return None, None, None
+            data = r.json()
+            d = (data or {}).get("data") or {}
+            v = d.get("play") or d.get("wmplay")
+            a = d.get("music")
+            title = d.get("title")
+            return v, a, title
+    except Exception:
+        return None, None, None
 
-        title = info.get("title") or "Video"
-        thumb = info.get("thumbnail") or ""
-        dur = info.get("duration") or ""
 
-        # platform name (اختياري)
-        extractor = info.get("extractor_key") or info.get("extractor") or ""
-        platform = (extractor or "").strip() or "Unknown"
+def pick_youtube_format(info: Dict[str, Any], kind: str) -> Tuple[str, str]:
+    """
+    YouTube:
+    - kind=video => أفضل mp4 مع صوت (قدر الإمكان)
+    - kind=audio => أفضل صوت
+    """
+    formats = info.get("formats") or []
+    title = info.get("title") or "youtube"
 
-        return JSONResponse({
-            "success": True,
-            "title": title,
-            "thumbnail": thumb,
-            "duration": str(dur) if dur is not None else "",
-            "platform": platform,
-            "url": url,
-        })
+    if kind == "audio":
+        # أفضل صوت
+        audio = None
+        for f in formats:
+            if f.get("vcodec") == "none" and f.get("url"):
+                abr = f.get("abr") or 0
+                if not audio or abr > (audio.get("abr") or 0):
+                    audio = f
+        if audio and audio.get("url"):
+            return audio["url"], title
+        raise HTTPException(status_code=404, detail="No audio format found")
+
+    # فيديو مع صوت: نفضّل progressive (فيه صوت+صورة)
+    progressive = None
+    for f in formats:
+        if f.get("acodec") != "none" and f.get("vcodec") != "none" and f.get("ext") == "mp4" and f.get("url"):
+            h = f.get("height") or 0
+            if not progressive or h > (progressive.get("height") or 0):
+                progressive = f
+    if progressive and progressive.get("url"):
+        return progressive["url"], title
+
+    # fallback: أفضل فيديو (بدون صوت) — كثير الأحيان اليوتيوب يحتاج دمج (غير ممكن في Vercel)
+    video_only = None
+    for f in formats:
+        if f.get("acodec") == "none" and f.get("vcodec") != "none" and f.get("url"):
+            h = f.get("height") or 0
+            if not video_only or h > (video_only.get("height") or 0):
+                video_only = f
+
+    if video_only and video_only.get("url"):
+        # بنرجع فيديو فقط كحل أخير (على Vercel لا نستطيع دمج صوت+فيديو)
+        return video_only["url"], title
+
+    raise HTTPException(status_code=404, detail="No video format found")
+
+
+def pick_generic_format(info: Dict[str, Any], kind: str) -> Tuple[str, str]:
+    """
+    للمنصات الأخرى: غالباً yt-dlp يعطينا url مباشر جاهز.
+    """
+    title = info.get("title") or "video"
+    if kind == "audio":
+        # ابحث عن bestaudio
+        for f in (info.get("formats") or [])[::-1]:
+            if f.get("vcodec") == "none" and f.get("url"):
+                return f["url"], title
+        # fallback: لو أعطى url واحد فقط
+        if info.get("url"):
+            return info["url"], title
+        raise HTTPException(status_code=404, detail="No audio found")
+
+    # فيديو
+    if info.get("url"):
+        return info["url"], title
+    # fallback من formats
+    fmts = info.get("formats") or []
+    best = None
+    for f in fmts:
+        if f.get("url") and f.get("vcodec") != "none":
+            h = f.get("height") or 0
+            if not best or h > (best.get("height") or 0):
+                best = f
+    if best and best.get("url"):
+        return best["url"], title
+
+    raise HTTPException(status_code=404, detail="No video found")
+
+
+@app.get("/api/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/api/info")
+def info(url: str = Query(..., min_length=5)):
+    """
+    معلومات بسيطة لعرضها في الواجهة.
+    """
+    platform = detect_platform(url)
+
+    # TikTok: جرّب TikWM أولاً
+    if platform == "tiktok":
+        # نرسل معلومات بسيطة (بدون formats معقدة)
+        # الفيديو/الصوت النهائي يتم عبر /api/proxy
+        return {
+            "title": "TikTok",
+            "thumbnail": "",
+            "duration": "",
+            "platform": "TikTok",
+        }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
+            data = ydl.extract_info(url, download=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"download/info failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"info_error: {str(e)}")
+
+    return {
+        "title": data.get("title") or "Video",
+        "thumbnail": data.get("thumbnail") or "",
+        "duration": str(data.get("duration") or ""),
+        "platform": platform,
+        "views": str(data.get("view_count") or "") if data.get("view_count") else "",
+    }
+
 
 @app.get("/api/proxy")
-def api_proxy(
-    url: str = Query(..., description="Video URL"),
-    type: Literal["video", "audio"] = Query("video"),
-    stream: int = Query(1, description="1=stream via server, 0=redirect"),
-    filename: Optional[str] = Query(None, description="Preferred filename without extension"),
+async def proxy(
+    url: str = Query(..., min_length=5),
+    type: str = Query("video", pattern="^(video|audio)$"),
+    stream: int = Query(1),  # 1 = streaming through our server (حل مشكلة CORS)
+    filename: str = Query("download"),
 ):
-    """
-    - stream=1: يرجّع 200 + Content-Disposition (أفضل للموبايل لتنزيل مباشر بدون صفحة ثانية)
-    - stream=0: Redirect للرابط المباشر (أسرع، لكن قد يفتح صفحة/تبويب)
-    """
-    try:
-        info = _extract_info(url)
-        formats = info.get("formats") or []
+    platform = detect_platform(url)
+    wanted = "audio" if type == "audio" else "video"
 
-        best_video = _pick_best_video_with_audio(info)
-        best_audio = _pick_best_audio(formats)
+    direct_url: Optional[str] = None
+    title: str = filename
 
-        chosen = best_video if type == "video" else best_audio
+    # TikTok handling
+    if platform == "tiktok":
+        v, a, t = await tiktok_direct(url)
+        title = t or filename or "tiktok"
+        direct_url = a if wanted == "audio" else v
+        if not direct_url:
+            # fallback yt-dlp
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
+                    data = ydl.extract_info(url, download=False)
+                direct_url, title = pick_generic_format(data, wanted)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"tiktok_error: {str(e)}")
 
-        # لو طلب صوت وما لقينا audio-only، نحاول نأخذ من progressive (الصوت داخل mp4)
-        if chosen is None and type == "audio":
-            # آخر حل: خذ best progressive mp4 (صوت داخل الفيديو)
-            chosen = best_video
+    else:
+        # Generic via yt-dlp
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts()) as ydl:
+                data = ydl.extract_info(url, download=False)
 
-        if chosen is None or not chosen.get("url"):
-            # هذا غالباً يعني: المنصة ما تعطي رابط مباشر (أو تتطلب cookies/DRM)
-            raise HTTPException(
-                status_code=400,
-                detail="No direct downloadable file found (mp4). This link may require login/cookies or provides HLS only.",
-            )
+            if platform == "youtube":
+                direct_url, title = pick_youtube_format(data, wanted)
+            else:
+                direct_url, title = pick_generic_format(data, wanted)
 
-        direct_url = chosen["url"]
-        ext = (chosen.get("ext") or ("mp3" if type == "audio" else "mp4")).lower()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"proxy_error: {str(e)}")
 
-        base_title = filename or (info.get("title") or "video")
-        final_name = _safe_filename(base_title, "mp3" if type == "audio" else ext)
+    if not direct_url:
+        raise HTTPException(status_code=404, detail="No direct url")
 
-        if stream == 0:
-            return RedirectResponse(url=direct_url)
+    # اسم ملف نهائي
+    base = safe_filename(filename or title or "download")
+    ext = ".mp3" if wanted == "audio" else ".mp4"
+    out_name = f"{base}{ext}"
 
-        headers = {
-            "Content-Disposition": f'attachment; filename="{final_name}"',
-            "Cache-Control": "no-store",
-            # يفيد لو احتجت تقرأ headers من الفرونت
-            "Access-Control-Expose-Headers": "Content-Disposition",
-        }
-        return StreamingResponse(_stream_remote(direct_url), media_type="application/octet-stream", headers=headers)
+    # لو المستخدم اختار stream=0 نرجّع redirect (قد يسبب CORS مع fetch)
+    if stream == 0:
+        # ملاحظة: لا يمكن فرض attachment عبر redirect
+        return Response(status_code=307, headers={"Location": direct_url})
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"proxy failed: {str(e)}")
+    # Streaming through our domain (أفضل حل لـ "فشل التحميل")
+    headers = {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "Referer": url,
+        "Origin": "https://example.com",
+    }
+
+    async def iter_bytes():
+        async with httpx.AsyncClient(timeout=None, follow_redirects=True, headers=headers) as client:
+            async with client.stream("GET", direct_url) as r:
+                if r.status_code >= 400:
+                    raise HTTPException(status_code=502, detail=f"upstream_status:{r.status_code}")
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 256):
+                    yield chunk
+
+    resp_headers = {
+        "Content-Disposition": f'attachment; filename="{out_name}"',
+        "Cache-Control": "no-store",
+    }
+
+    return StreamingResponse(iter_bytes(), media_type="application/octet-stream", headers=resp_headers)
