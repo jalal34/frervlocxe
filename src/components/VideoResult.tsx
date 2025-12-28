@@ -7,6 +7,8 @@ interface VideoInfo {
   duration: string;
   platform: string;
   views?: string;
+  // لو عندك formats من /api/info وتبي تستخدمها لليوتيوب لاحقًا
+  formats?: Array<{ type: string; label: string; format_id: string; ext: string }>;
 }
 
 interface VideoResultProps {
@@ -18,29 +20,24 @@ interface VideoResultProps {
 const VideoResult = ({ video, originalUrl }: VideoResultProps) => {
   const { t } = useLanguage();
 
-  const downloadViaFetch = async (apiUrl: string, suggestedName: string) => {
-    try {
-      const res = await fetch(apiUrl);
-      if (!res.ok) throw new Error('Download failed');
-      const blob = await res.blob();
-      const objectUrl = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = objectUrl;
-      a.download = suggestedName;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(objectUrl);
-    } catch (e) {
-      // fallback: normal navigation
-      window.location.href = apiUrl;
-    }
+  // ✅ تنزيل مباشر بدون فتح صفحة جديدة (أفضل حل عملي على الجوال مع Redirect)
+  const downloadDirect = (url: string) => {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+
+    setTimeout(() => {
+      iframe.remove();
+    }, 15000);
   };
 
-  const baseProxy = `/api/proxy?url=${encodeURIComponent(originalUrl)}&stream=1&filename=${encodeURIComponent(
+  // 👇 نفس روابطك، فقط أضفت format_id لليوتيوب لو احتجته لاحقًا
+  const baseProxy = `/api/proxy?url=${encodeURIComponent(originalUrl)}&filename=${encodeURIComponent(
     video.title
   )}`;
 
+  // لغير اليوتيوب: فقط نوع (video/audio)
   const videoDownloadUrl = `${baseProxy}&type=video`;
   const audioDownloadUrl = `${baseProxy}&type=audio`;
 
@@ -106,7 +103,7 @@ const VideoResult = ({ video, originalUrl }: VideoResultProps) => {
                     target="_self"
                     onClick={(e) => {
                       e.preventDefault();
-                      downloadViaFetch(videoDownloadUrl, `${video.title}.mp4`);
+                      downloadDirect(videoDownloadUrl);
                     }}
                     className="download-option-btn group flex items-center justify-between"
                   >
@@ -125,7 +122,7 @@ const VideoResult = ({ video, originalUrl }: VideoResultProps) => {
                     target="_self"
                     onClick={(e) => {
                       e.preventDefault();
-                      downloadViaFetch(audioDownloadUrl, `${video.title}.mp3`);
+                      downloadDirect(audioDownloadUrl);
                     }}
                     className="download-option-btn group flex items-center justify-between"
                   >
@@ -140,7 +137,7 @@ const VideoResult = ({ video, originalUrl }: VideoResultProps) => {
                 </div>
 
                 <p className="text-xs text-muted-foreground/80">
-                  ملاحظة: بعض المنصات قد تعطي الصوت بصيغة m4a لكن سيتم تنزيله مباشرة.
+                  ملاحظة: بعض المنصات قد تعطي الصوت بصيغة m4a أو mp3 حسب المصدر، وسيتم تنزيله مباشرة.
                 </p>
               </div>
             </div>
